@@ -11,13 +11,13 @@
 ## Examples
 ```powershell
 # Local CA, last 7 days, preview only (no certutil execution)
-.-Get-IssuedCertCount.ps1 -LastDays 7 -OutCsv C:	emp\out.csv -Preview -Verbose
+.\03-Get-IssuedCertCount.ps1 -LastDays 7 -OutCsv C:	emp\out.csv -Preview -Verbose
 
 # Remote CA, explicit date range
-.-Get-IssuedCertCount.ps1 -CAConfig 'CAHOST\Corp-Issuing-CA' `
-  -From '2025-01-01' -To '2025-06-30' -OutCsv C:	empange.csv -Verbose
+.\03-Get-IssuedCertCount.ps1 -CAConfig 'CAHOST\Corp-Issuing-CA' `
+  -From '2025-01-01' -To '2025-06-30' -OutCsv C:	emp
+ange.csv -Verbose
 
 # All rows regardless of disposition
-.-Get-IssuedCertCount.ps1 -Disposition All -OutCsv C:	empll.csv
+.\03-Get-IssuedCertCount.ps1 -Disposition All -OutCsv C:	empll.csv
 ```
-Generated: 20250902-200708
