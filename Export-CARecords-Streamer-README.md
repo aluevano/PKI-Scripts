@@ -38,3 +38,23 @@ $cols = 'RequestID','SerialNumber','CommonName','RequesterName','CertificateTemp
   -OutCsv C:\PKI\Exports\AllIssued.csv -FlushEvery 2000 -Verbose
 ```
 
+# Export-CARecords-Streamer.ps1 (v1.2)
+
+**What’s fixed**
+- Removed **all** `.ContainsKey()` calls (which fail on `OrderedDictionary`). We now use `.Contains()` everywhere it matters.
+- Continued-line handling uses the last seen key robustly.
+- No other non-existent methods are referenced.
+
+## Quick usage
+```powershell
+# Export all Issued certs (no dates), flush every 1000 rows
+.\Export-CARecords-Streamer.ps1 -OutCsv C:\PKI\Exports\AllIssued.csv -Disposition 20 -FlushEvery 1000 -Verbose
+
+# RequestID-batched export: 50k IDs per batch
+.\Export-CARecords-Streamer.ps1 -RequestIDStart 1 -RequestIDEnd 1500000 -RequestIDBatchSize 50000 `
+  -OutCsv C:\PKI\Exports\AllIssued.csv -FlushEvery 2000 -Verbose
+
+# Minimal columns
+$cols = 'RequestID','SerialNumber','NotBefore','NotAfter','Thumbprint'
+.\Export-CARecords-Streamer.ps1 -OutCsv C:\PKI\Exports\Minimal.csv -Properties $cols -FlushEvery 1500 -Verbose
+
