@@ -1,16 +1,47 @@
 <#
 .SYNOPSIS
-  Export Microsoft CA certificate records to CSV in a memory-safe way (streaming + flush-every-N).
+  Crash-safe exporter for Microsoft CA: no .NET event handlers, no ISE hangs.
+  Streams certutil output via TEMP FILES and flushes every N rows to CSV.
 
 .VERSION
-  v1.2 – OrderedDictionary-safe: removed ALL .ContainsKey() usages; use .Contains() consistently.
-         Safer continuation handling; minor robustness improvements.
+  v1.3 – Stability-first on WMF 5.1 / Server 2012 R2:
+        * No DataReceived event handlers (avoids ScriptBlock.GetContextFromTLS).
+        * Uses Start-Process with -RedirectStandardOutput/-RedirectStandardError to files.
+        * Parses the output file line-by-line and flushes every N rows.
+        * RequestID window batching supported (no dates required).
 
 .DESCRIPTION
-  - Streams certutil output and writes CSV every X rows.
-  - No date filters required. Optional RequestID window batching.
-  - Select properties to export via -Properties (friendly names).
+  - Runs 'certutil -view' in a child process, redirecting stdout/stderr to files.
+  - After the child exits (or hits timeout), parses the stdout file sequentially.
+  - Writes CSV in chunks (FlushEvery) to keep memory flat even for huge exports.
+  - Optional RequestID batching to keep each certutil pass bounded.
 
+.PARAMETER OutCsv
+  Path to final CSV. The directory is created if needed. Appends after first chunk.
+
+.PARAMETER CAConfig
+  Optional CA config "HOST\CA Common Name". If omitted, tries to auto-detect local CA instance.
+
+.PARAMETER Disposition
+  Filter by code or "All". Default 20 (Issued). Common: 20,21,9,22.
+
+.PARAMETER Properties
+  Friendly property list to export. Defaults cover typical inventory.
+
+.PARAMETER FlushEvery
+  How many records to buffer before writing to CSV (default 1000).
+
+.PARAMETER TimeoutSec
+  Timeout for each certutil run (default 0 = no timeout).
+
+.PARAMETER RequestIDStart / RequestIDEnd / RequestIDBatchSize
+  Optional RequestID windowing. Use when you want to avoid very long single certutil runs.
+
+.PARAMETER ScratchDir
+  Optional folder for temp stdout/stderr files. Defaults to $env:TEMP.
+
+.PARAMETER Preview
+  Print the certutil command(s) that WOULD run and exit.
 #>
 [CmdletBinding()]
 param(
@@ -50,6 +81,9 @@ param(
     [Parameter()]
     [ValidateRange(1000, 10000000)]
     [int]$RequestIDBatchSize = 50000,
+
+    [Parameter()]
+    [string]$ScratchDir = $env:TEMP,
 
     [Parameter()]
     [switch]$Preview
@@ -114,127 +148,128 @@ function Build-CertutilArgs {
     return $args
 }
 
-function Start-CertutilProcess {
-    param([string[]]$Args,[int]$TimeoutSec,[switch]$Preview)
+function Start-CertutilToFiles {
+    param([string[]]$Args,[string]$ScratchDir,[int]$TimeoutSec,[switch]$Preview)
+
+    if (-not (Test-Path $ScratchDir)) { New-Item -ItemType Directory -Path $ScratchDir -Force | Out-Null }
+    $guid = [Guid]::NewGuid().ToString('N')
+    $stdout = Join-Path $ScratchDir "certutil_$guid.out.txt"
+    $stderr = Join-Path $ScratchDir "certutil_$guid.err.txt"
+
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = 'certutil.exe'
-    $psi.Arguments = ($Args | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() }) -join ' '
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError  = $true
+    $psi.FileName = 'cmd.exe'
+    # Use cmd.exe /c to have reliable redirection on downlevel hosts
+    $cmd = 'certutil.exe ' + (($Args | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() }) -join ' ')
+    $psi.Arguments = '/c ' + $cmd + ' 1>"' + $stdout + '" 2>"' + $stderr + '"'
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
 
-    Write-Verbose "certutil.exe $($psi.Arguments)"
+    Write-Verbose "cmd.exe $($psi.Arguments)"
     if ($Preview) {
-        Write-Host "[Preview] certutil.exe $($psi.Arguments)"
-        return $null
+        Write-Host "[Preview] $cmd"
+        return @('PREVIEW',$stdout,$stderr)
     }
 
-    $proc = New-Object System.Diagnostics.Process
-    $proc.StartInfo = $psi
+    $proc = [System.Diagnostics.Process]::Start($psi)
 
-    $global:__sbErr = New-Object System.Text.StringBuilder
-    $errorHandler = [System.Diagnostics.DataReceivedEventHandler]{
-        param($sender,$e)
-        if ($null -ne $e.Data) { [void]$global:__sbErr.AppendLine($e.Data) }
-    }
-
-    $null = $proc.Start()
-    $proc.add_ErrorDataReceived($errorHandler)
-    $proc.BeginErrorReadLine()
-
-    return $proc
-}
-
-function Write-Chunk {
-    param([System.Collections.Generic.List[object]]$Chunk,[string]$OutCsv,[ref]$HeaderWritten)
-    if ($Chunk.Count -gt 0) {
-        if (-not $HeaderWritten.Value) {
-            $Chunk | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
-            $HeaderWritten.Value = $true
-        } else {
-            $Chunk | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8 -Append
+    if ($TimeoutSec -gt 0) {
+        if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+            try { $proc.Kill() } catch {}
+            throw "certutil timed out after $TimeoutSec seconds."
         }
-        $Chunk.Clear()
+    } else {
+        $proc.WaitForExit()
     }
+
+    $exit = $proc.ExitCode
+    return @($exit,$stdout,$stderr)
 }
 
-function Parse-And-Flush {
+function Parse-StdoutFile {
     param(
-        [System.Diagnostics.Process]$Proc,
-        [string[]]$OutFields,
+        [string]$StdoutPath,
         [string[]]$Properties,
         [hashtable]$FieldMap,
         [int]$FlushEvery,
         [string]$OutCsv,
         [switch]$Append
     )
-    # certutil field -> friendly property
+
     $inverse = @{}
     foreach ($p in $Properties) {
         $f = $FieldMap[$p]
         if ($f) { $inverse[$f] = $p }
     }
 
-    $current = [ordered]@{}
-    $chunk = New-Object System.Collections.Generic.List[object]
-    $rows  = 0
-    $w = New-Object System.IO.StreamReader($Proc.StandardOutput.BaseStream, [Text.Encoding]::Default)
-
     $headerWritten = [ref]$false
     if ($Append) { $headerWritten = [ref]$true }
 
-    while (-not $w.EndOfStream) {
-        $line = $w.ReadLine()
-        if ($null -eq $line) { continue }
+    $current = [ordered]@{}
+    $chunk = New-Object System.Collections.Generic.List[object]
+    $rows = 0
 
-        # boundaries between records
-        if ($line -match '^certutil:' -or $line -match '^-{5,}$' -or $line -match '^\s*$') {
-            if ($current.Count) {
-                $o = [ordered]@{}
-                foreach ($p in $Properties) {
-                    $name = $FieldMap[$p]
-                    $val  = $current[$name]
-                    if ($p -eq 'CertificateTemplate' -and $val) {
-                        if ($val -match '^(?<name>[^\(]+)\s*\(') { $val = $Matches.name.Trim() }
+    $fs = [System.IO.File]::Open($StdoutPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+        $sr = New-Object System.IO.StreamReader($fs, [Text.Encoding]::Default)
+        try {
+            while (-not $sr.EndOfStream) {
+                $line = $sr.ReadLine()
+                if ($null -eq $line) { continue }
+
+                if ($line -match '^certutil:' -or $line -match '^-{5,}$' -or $line -match '^\s*$') {
+                    if ($current.Count) {
+                        $o = [ordered]@{}
+                        foreach ($p in $Properties) {
+                            $name = $FieldMap[$p]
+                            $val  = $current[$name]
+                            if ($p -eq 'CertificateTemplate' -and $val) {
+                                if ($val -match '^(?<name>[^\(]+)\s*\(') { $val = $Matches.name.Trim() }
+                            }
+                            if ($p -eq 'Thumbprint' -and $val) { $val = ($val -replace '\s','').ToUpper() }
+                            $o[$p] = $val
+                        }
+                        $chunk.Add([pscustomobject]$o)
+                        $rows++
+                        $current = [ordered]@{}
+
+                        if ($chunk.Count -ge $FlushEvery) {
+                            if (-not $headerWritten.Value) {
+                                $chunk | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
+                                $headerWritten.Value = $true
+                            } else {
+                                $chunk | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8 -Append
+                            }
+                            $chunk.Clear()
+                        }
                     }
-                    if ($p -eq 'Thumbprint' -and $val) { $val = ($val -replace '\s','').ToUpper() }
-                    $o[$p] = $val
+                    continue
                 }
-                $chunk.Add([pscustomobject]$o)
-                $rows++
-                $current = [ordered]@{}
 
-                if ($chunk.Count -ge $FlushEvery) {
-                    Write-Chunk -Chunk $chunk -OutCsv $OutCsv -HeaderWritten $headerWritten
-                }
-            }
-            continue
-        }
-
-        # key: value
-        $i = $line.IndexOf(':')
-        if ($i -gt 0) {
-            $k = ($line.Substring(0,$i)).Trim()
-            $v = ($line.Substring($i+1)).Trim()
-
-            if ($inverse.ContainsKey($k)) {
-                if ($current.Contains($k)) {
-                    $current[$k] = ($current[$k] + " " + $v).Trim()
+                $i = $line.IndexOf(':')
+                if ($i -gt 0) {
+                    $k = ($line.Substring(0,$i)).Trim()
+                    $v = ($line.Substring($i+1)).Trim()
+                    if ($inverse.ContainsKey($k)) {
+                        if ($current.Contains($k)) {
+                            $current[$k] = ($current[$k] + " " + $v).Trim()
+                        } else {
+                            $current[$k] = $v
+                        }
+                    }
                 } else {
-                    $current[$k] = $v
+                    if ($current.Count) {
+                        $lastKey = ($current.Keys | Select-Object -Last 1)
+                        if ($lastKey) { $current[$lastKey] = ($current[$lastKey] + " " + $line.Trim()).Trim() }
+                    }
                 }
             }
-        } else {
-            # continuation for previous kept key (wrapped lines)
-            if ($current.Count) {
-                $lastKey = ($current.Keys | Select-Object -Last 1)
-                if ($lastKey) { $current[$lastKey] = ($current[$lastKey] + " " + $line.Trim()).Trim() }
-            }
+        } finally {
+            $sr.Close()
         }
+    } finally {
+        $fs.Close()
     }
 
-    # final record flush
     if ($current.Count) {
         $o = [ordered]@{}
         foreach ($p in $Properties) {
@@ -250,8 +285,15 @@ function Parse-And-Flush {
         $rows++
     }
 
-    # final chunk write
-    Write-Chunk -Chunk $chunk -OutCsv $OutCsv -HeaderWritten $headerWritten
+    if ($chunk.Count -gt 0) {
+        if (-not $headerWritten.Value) {
+            $chunk | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
+            $headerWritten.Value = $true
+        } else {
+            $chunk | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8 -Append
+        }
+        $chunk.Clear()
+    }
 
     return $rows
 }
@@ -260,7 +302,7 @@ try {
     Test-CertutilPresent
     $cfg = Resolve-CAConfig -Explicit $CAConfig
 
-    # Validate properties (OrderedDictionary-safe membership test)
+    # Validate properties (membership test safe for OrderedDictionary)
     $unknown = $Properties | Where-Object { -not $FieldMap.Contains($_) }
     if ($unknown) {
         $valid = ($FieldMap.Keys -join ', ')
@@ -280,70 +322,40 @@ try {
             $batchId++
             $restrict = New-Restrict -Disposition $Disposition -ReqStart $s -ReqEnd $e
             $args = Build-CertutilArgs -CAConfig $cfg -Restrict $restrict -OutFields $outFields
-            if ($Preview) { Write-Host "[Preview] Batch ${batchId}: $s..$e" }
-            $proc = Start-CertutilProcess -Args $args -TimeoutSec $TimeoutSec -Preview:$Preview
+            $exit,$stdout,$stderr = Start-CertutilToFiles -Args $args -ScratchDir $ScratchDir -TimeoutSec $TimeoutSec -Preview:$Preview
             if ($Preview) { continue }
 
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            $rows = Parse-And-Flush -Proc $proc -OutFields $outFields -Properties $Properties -FieldMap $FieldMap -FlushEvery $FlushEvery -OutCsv $OutCsv -Append:$headerExists
-
-            if ($TimeoutSec -gt 0) {
-                $deadline = (Get-Date).AddSeconds($TimeoutSec)
-                while (-not $proc.HasExited) {
-                    Start-Sleep -Milliseconds 200
-                    if ((Get-Date) -gt $deadline) {
-                        try { $proc.Kill() } catch {}
-                        throw "certutil timed out after $TimeoutSec seconds."
-                    }
-                }
-            } else {
-                $proc.WaitForExit()
+            if ($exit -ne 0) {
+                $errText = ''
+                if (Test-Path $stderr) { $errText = (Get-Content -Path $stderr -ErrorAction SilentlyContinue | Out-String).Trim() }
+                throw "Batch $batchId ($s..$e) failed with exit $exit. $errText"
             }
 
-            if ($proc.ExitCode -ne 0) {
-                $err = $global:__sbErr.ToString().Trim()
-                if (-not $err) { $err = "certutil exit code $($proc.ExitCode)" }
-                throw "Batch $batchId ($s..$e) failed: $err"
-            }
-
-            $sw.Stop()
+            $rows = Parse-StdoutFile -StdoutPath $stdout -Properties $Properties -FieldMap $FieldMap -FlushEvery $FlushEvery -OutCsv $OutCsv -Append:$headerExists
             $total += $rows
             $headerExists = $true
-            Write-Verbose ("Batch {0} [{1}..{2}]: {3} rows in {4}s (total {5})" -f $batchId,$s,$e,$rows,[Math]::Round($sw.Elapsed.TotalSeconds,2),$total)
+
+            # Cleanup temp files
+            Remove-Item -Path $stdout,$stderr -ErrorAction SilentlyContinue
+            Write-Verbose ("Batch {0} [{1}..{2}]: {3} rows (total {4})" -f $batchId,$s,$e,$rows,$total)
         }
-    }
-    else {
-        # Single streaming export (no batching)
+    } else {
         $restrict = New-Restrict -Disposition $Disposition -ReqStart $null -ReqEnd $null
         $args = Build-CertutilArgs -CAConfig $cfg -Restrict $restrict -OutFields $outFields
-        $proc = Start-CertutilProcess -Args $args -TimeoutSec $TimeoutSec -Preview:$Preview
+        $exit,$stdout,$stderr = Start-CertutilToFiles -Args $args -ScratchDir $ScratchDir -TimeoutSec $TimeoutSec -Preview:$Preview
         if ($Preview) { return }
 
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $rows = Parse-And-Flush -Proc $proc -OutFields $outFields -Properties $Properties -FieldMap $FieldMap -FlushEvery $FlushEvery -OutCsv $OutCsv -Append:$headerExists
-
-        if ($TimeoutSec -gt 0) {
-            $deadline = (Get-Date).AddSeconds($TimeoutSec)
-            while (-not $proc.HasExited) {
-                Start-Sleep -Milliseconds 200
-                if ((Get-Date) -gt $deadline) {
-                    try { $proc.Kill() } catch {}
-                    throw "certutil timed out after $TimeoutSec seconds."
-                }
-            }
-        } else {
-            $proc.WaitForExit()
+        if ($exit -ne 0) {
+            $errText = ''
+            if (Test-Path $stderr) { $errText = (Get-Content -Path $stderr -ErrorAction SilentlyContinue | Out-String).Trim() }
+            throw "certutil failed with exit $exit. $errText"
         }
 
-        if ($proc.ExitCode -ne 0) {
-            $err = $global:__sbErr.ToString().Trim()
-            if (-not $err) { $err = "certutil exit code $($proc.ExitCode)" }
-            throw $err
-        }
-
-        $sw.Stop()
+        $rows = Parse-StdoutFile -StdoutPath $stdout -Properties $Properties -FieldMap $FieldMap -FlushEvery $FlushEvery -OutCsv $OutCsv -Append:$headerExists
         $total = $rows
-        Write-Verbose ("Streamed export: {0} rows in {1}s" -f $rows, [Math]::Round($sw.Elapsed.TotalSeconds,2))
+
+        Remove-Item -Path $stdout,$stderr -ErrorAction SilentlyContinue
+        Write-Verbose ("Streamed export (single pass): {0} rows" -f $rows)
     }
 
     Write-Host "Export complete. Total rows: $total -> $OutCsv"

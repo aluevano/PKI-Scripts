@@ -28,16 +28,6 @@ $cols = 'RequestID','SerialNumber','CommonName','RequesterName','CertificateTemp
 - CA selection: omit -CAConfig to auto-detect the local CA, or pass "HOST\CA Common Name".
 
 
-## Quick starts
-```powershell
-# Export all Issued certs to CSV, flushing every 1000 rows
-.\Export-CARecords-Streamer.ps1 -OutCsv C:\PKI\Exports\AllIssued.csv -Disposition 20 -FlushEvery 1000 -Verbose
-
-# RequestID window batching: 50k IDs per batch
-.\Export-CARecords-Streamer.ps1 -RequestIDStart 1 -RequestIDEnd 1500000 -RequestIDBatchSize 50000 `
-  -OutCsv C:\PKI\Exports\AllIssued.csv -FlushEvery 2000 -Verbose
-```
-
 # Export-CARecords-Streamer.ps1 (v1.2)
 
 **What’s fixed**
@@ -45,7 +35,15 @@ $cols = 'RequestID','SerialNumber','CommonName','RequesterName','CertificateTemp
 - Continued-line handling uses the last seen key robustly.
 - No other non-existent methods are referenced.
 
-## Quick usage
+# Export-CARecords-Streamer.ps1 (v1.3) — Crash-safe for Server 2012 R2 / WMF 5.1
+
+**Why this version is stable:**
+- No .NET event handlers or cross-thread ScriptBlock calls.
+- Child process writes stdout/stderr to temp files; the script parses them after exit.
+- Still flushes every N records to keep memory flat.
+- Optional RequestID batching.
+
+## Examples
 ```powershell
 # Export all Issued certs (no dates), flush every 1000 rows
 .\Export-CARecords-Streamer.ps1 -OutCsv C:\PKI\Exports\AllIssued.csv -Disposition 20 -FlushEvery 1000 -Verbose
@@ -58,3 +56,7 @@ $cols = 'RequestID','SerialNumber','CommonName','RequesterName','CertificateTemp
 $cols = 'RequestID','SerialNumber','NotBefore','NotAfter','Thumbprint'
 .\Export-CARecords-Streamer.ps1 -OutCsv C:\PKI\Exports\Minimal.csv -Properties $cols -FlushEvery 1500 -Verbose
 
+# ID windowing + timeout
+.\Export-CARecords-Streamer.ps1 -RequestIDStart 1 -RequestIDEnd 1500000 -RequestIDBatchSize 50000 `
+  -OutCsv C:\PKI\Exports\AllIssued.csv -FlushEvery 2000 -TimeoutSec 3600 -Verbose
+```
