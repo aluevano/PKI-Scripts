@@ -1,371 +1,260 @@
-<#
+<# 
 .SYNOPSIS
-  Crash-safe exporter for Microsoft CA: no .NET event handlers, no ISE hangs.
-  Streams certutil output via TEMP FILES and flushes every N rows to CSV.
+  Streams the CA DB via 'certutil -view -csv' safely to chunked CSV files.
+  Fixes row parsing for quoted CSV and extracts only the Certificate Template *name*.
 
-.VERSION
-  v1.3 – Stability-first on WMF 5.1 / Server 2012 R2:
-        * No DataReceived event handlers (avoids ScriptBlock.GetContextFromTLS).
-        * Uses Start-Process with -RedirectStandardOutput/-RedirectStandardError to files.
-        * Parses the output file line-by-line and flushes every N rows.
-        * RequestID window batching supported (no dates required).
+.PARAMS
+  -CAConfig         e.g. 'CAHOST\Contoso-CA'
+  -OutputDirectory  e.g. 'D:\CA-Export'
+  -BaseFileName     base for chunk files (default: CA_DB_Export)
+  -BatchSize        rows per chunk (default: 100000)
+  -Restrict         certutil -restrict filter (optional)
+  -Columns          Comma-separated list of fields to request from certutil
+  -TemplateField    The header name that holds the certificate template info (default tries to auto-detect)
+  -CertutilPath     Path to certutil (default: certutil)
 
-.DESCRIPTION
-  - Runs 'certutil -view' in a child process, redirecting stdout/stderr to files.
-  - After the child exits (or hits timeout), parses the stdout file sequentially.
-  - Writes CSV in chunks (FlushEvery) to keep memory flat even for huge exports.
-  - Optional RequestID batching to keep each certutil pass bounded.
-
-.PARAMETER OutCsv
-  Path to final CSV. The directory is created if needed. Appends after first chunk.
-
-.PARAMETER CAConfig
-  Optional CA config "HOST\CA Common Name". If omitted, tries to auto-detect local CA instance.
-
-.PARAMETER Disposition
-  Filter by code or "All". Default 20 (Issued). Common: 20,21,9,22.
-
-.PARAMETER Properties
-  Friendly property list to export. Defaults cover typical inventory.
-
-.PARAMETER FlushEvery
-  How many records to buffer before writing to CSV (default 1000).
-
-.PARAMETER TimeoutSec
-  Timeout for each certutil run (default 0 = no timeout).
-
-.PARAMETER RequestIDStart / RequestIDEnd / RequestIDBatchSize
-  Optional RequestID windowing. Use when you want to avoid very long single certutil runs.
-
-.PARAMETER ScratchDir
-  Optional folder for temp stdout/stderr files. Defaults to $env:TEMP.
-
-.PARAMETER Preview
-  Print the certutil command(s) that WOULD run and exit.
+.NOTES
+  - Requires read access to the CA DB.
+  - Does *not* hold the entire dataset in memory.
 #>
-[CmdletBinding()]
+
 param(
-    [Parameter(Mandatory=$true)]
-    [ValidateNotNullOrEmpty()]
-    [string]$OutCsv,
+  [Parameter(Mandatory=$true)]
+  [string]$CAConfig,
 
-    [Parameter()]
-    [string]$CAConfig,
+  [Parameter(Mandatory=$true)]
+  [string]$OutputDirectory,
 
-    [Parameter()]
-    [ValidatePattern('^(All|[0-9]+)$')]
-    [string]$Disposition = '20',
-
-    [Parameter()]
-    [string[]]$Properties = @(
-        'RequestID','SerialNumber','CommonName','RequesterName',
-        'CertificateTemplate','NotBefore','NotAfter','Thumbprint','UPN','SAN','SubjectDN'
-    ),
-
-    [Parameter()]
-    [ValidateRange(1, 100000)]
-    [int]$FlushEvery = 1000,
-
-    [Parameter()]
-    [ValidateRange(0, 86400)]
-    [int]$TimeoutSec = 0,
-
-    [Parameter()]
-    [ValidateRange(1, 2147483647)]
-    [int]$RequestIDStart,
-
-    [Parameter()]
-    [ValidateRange(1, 2147483647)]
-    [int]$RequestIDEnd,
-
-    [Parameter()]
-    [ValidateRange(1000, 10000000)]
-    [int]$RequestIDBatchSize = 50000,
-
-    [Parameter()]
-    [string]$ScratchDir = $env:TEMP,
-
-    [Parameter()]
-    [switch]$Preview
+  [string]$BaseFileName = "CA_DB_Export",
+  [int]$BatchSize = 100000,
+  [string]$Restrict = "",
+  # Keep your list tight for performance; include the template field.
+  [string]$Columns = "RequestID,SerialNumber,NotBefore,NotAfter,RequesterName,CertificateTemplate,CertificateHash,RequestDisposition",
+  # If your header isn’t exactly "CertificateTemplate", set this (e.g., "Certificate Template")
+  [string]$TemplateField = "",
+  [string]$CertutilPath = "certutil"
 )
 
-function Test-CertutilPresent {
-    if (-not (Get-Command certutil.exe -ErrorAction SilentlyContinue)) {
-        throw "certutil.exe not found. Install AD CS tools or run on the CA host."
-    }
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# --- Prep output directory
+if (-not (Test-Path -LiteralPath $OutputDirectory)) {
+  New-Item -ItemType Directory -Path $OutputDirectory | Out-Null
 }
 
-function Resolve-CAConfig {
-    param([string]$Explicit)
-    if ($Explicit) { return $Explicit }
-    $base = 'HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration'
-    if (-not (Test-Path $base)) { return $null }
-    $active = (Get-ItemProperty -Path $base -Name 'Active' -ErrorAction SilentlyContinue).Active
-    if ($active) { return "$env:COMPUTERNAME\$active" }
-    return $null
-}
+# Normalize columns -> array and trim
+$colList = $Columns.Split(',').ForEach({ $_.Trim() }) | Where-Object { $_ -ne "" }
+if ($colList.Count -eq 0) { throw "No columns specified." }
 
-# Friendly -> certutil field mapping (OrderedDictionary)
-$FieldMap = [ordered]@{
-    'RequestID'           = 'RequestID'
-    'SerialNumber'        = 'SerialNumber'
-    'NotBefore'           = 'Certificate Effective Date'
-    'NotAfter'            = 'Certificate Expiration Date'
-    'RequesterName'       = 'Requester Name'
-    'CommonName'          = 'Common Name'
-    'SubjectDN'           = 'Distinguished Name'
-    'CertificateTemplate' = 'Certificate Template'
-    'Thumbprint'          = 'Certificate Hash'
-    'UPN'                 = 'UPN'
-    'SAN'                 = 'SAN'
-}
+# Build certutil args (CSV mode)
+$restrictArg = if ([string]::IsNullOrWhiteSpace($Restrict)) { "" } else { "-restrict `"$Restrict`"" }
+$columnsArg  = "-out `"$($colList -join ',')`""
 
-function Ensure-Dir([string]$path) {
-    $dir = Split-Path -Parent $path
-    if ($dir) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-}
+$certutilArgs = @(
+  "-config", $CAConfig,
+  "-view",
+  $columnsArg,
+  "csv"
+)
+if ($restrictArg) { $certutilArgs += $restrictArg }
 
-function New-Restrict {
-    param(
-        [string]$Disposition,
-        [Nullable[int]]$ReqStart,
-        [Nullable[int]]$ReqEnd
-    )
-    $parts = @()
-    if ($Disposition -ne 'All') { $parts += "Disposition=$Disposition" }
-    if ($ReqStart) { $parts += "RequestID>=$ReqStart" }
-    if ($ReqEnd)   { $parts += "RequestID<=$ReqEnd" }
-    if ($parts.Count -eq 0) { return $null } else { return ($parts -join ' AND ') }
-}
+Write-Host "Launching certutil (CSV mode)..." -ForegroundColor Cyan
+Write-Host "  CA Config : $CAConfig"
+Write-Host "  Restrict  : $Restrict"
+Write-Host "  Columns   : $Columns"
+Write-Host "  BatchSize : $BatchSize"
+Write-Host "  OutputDir : $OutputDirectory"
+Write-Host ""
 
-function Build-CertutilArgs {
-    param([string]$CAConfig,[string]$Restrict,[string[]]$OutFields)
-    $args = @()
-    if ($CAConfig) { $args += @('-config', ('"'+$CAConfig+'"')) }
-    $args += @('-view')
-    if ($Restrict) { $args += @('-restrict', ('"'+$Restrict+'"')) }
-    $args += @('-out', ('"'+($OutFields -join ',')+'"'))
-    return $args
-}
+# --- Start certutil process
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = $CertutilPath
+$psi.Arguments = ($certutilArgs -join ' ')
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError  = $true
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
 
-function Start-CertutilToFiles {
-    param([string[]]$Args,[string]$ScratchDir,[int]$TimeoutSec,[switch]$Preview)
+$proc = New-Object System.Diagnostics.Process
+$proc.StartInfo = $psi
+if (-not $proc.Start()) { throw "Failed to start certutil." }
 
-    if (-not (Test-Path $ScratchDir)) { New-Item -ItemType Directory -Path $ScratchDir -Force | Out-Null }
-    $guid = [Guid]::NewGuid().ToString('N')
-    $stdout = Join-Path $ScratchDir "certutil_$guid.out.txt"
-    $stderr = Join-Path $ScratchDir "certutil_$guid.err.txt"
+$stdOut = $proc.StandardOutput
+$stdErr = $proc.StandardError
 
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = 'cmd.exe'
-    # Use cmd.exe /c to have reliable redirection on downlevel hosts
-    $cmd = 'certutil.exe ' + (($Args | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() }) -join ' ')
-    $psi.Arguments = '/c ' + $cmd + ' 1>"' + $stdout + '" 2>"' + $stderr + '"'
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
+# ---------- Shared state ----------
+$script:totalRows   = 0L
+$script:rowsInChunk = 0
+$script:chunkIndex  = 1
+$script:startTime   = Get-Date
+$script:lastTickTime = $script:startTime
+$script:lastTickRows = 0L
+[int]$statusEvery = 10000
 
-    Write-Verbose "cmd.exe $($psi.Arguments)"
-    if ($Preview) {
-        Write-Host "[Preview] $cmd"
-        return @('PREVIEW',$stdout,$stderr)
-    }
+# ----- CSV helpers -----
 
-    $proc = [System.Diagnostics.Process]::Start($psi)
+function Split-CsvLine {
+  <#
+    Robustly split a single CSV line into fields (RFC-style quotes).
+    Returns [string[]] fields.
+  #>
+  param([Parameter(Mandatory=$true)][string]$Line)
 
-    if ($TimeoutSec -gt 0) {
-        if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
-            try { $proc.Kill() } catch {}
-            throw "certutil timed out after $TimeoutSec seconds."
-        }
+  $inQuotes = $false
+  $sb = New-Object System.Text.StringBuilder
+  $fields = New-Object System.Collections.Generic.List[string]
+  for ($i=0; $i -lt $Line.Length; $i++) {
+    $ch = $Line[$i]
+    if ($ch -eq '"') {
+      if ($inQuotes -and ($i + 1 -lt $Line.Length) -and $Line[$i+1] -eq '"') {
+        # Escaped quote -> append one quote and skip the next
+        $null = $sb.Append('"'); $i++
+      } else {
+        $inQuotes = -not $inQuotes
+      }
+    } elseif ($ch -eq ',' -and -not $inQuotes) {
+      $fields.Add($sb.ToString()); $sb.Clear() | Out-Null
     } else {
-        $proc.WaitForExit()
+      $null = $sb.Append($ch)
     }
-
-    $exit = $proc.ExitCode
-    return @($exit,$stdout,$stderr)
+  }
+  $fields.Add($sb.ToString())
+  return ,$fields.ToArray()
 }
 
-function Parse-StdoutFile {
-    param(
-        [string]$StdoutPath,
-        [string[]]$Properties,
-        [hashtable]$FieldMap,
-        [int]$FlushEvery,
-        [string]$OutCsv,
-        [switch]$Append
-    )
+# Extract only the Template *Name* from various certutil formats.
+function Get-TemplateNameOnly {
+  param([string]$Raw)
 
-    $inverse = @{}
-    foreach ($p in $Properties) {
-        $f = $FieldMap[$p]
-        if ($f) { $inverse[$f] = $p }
-    }
+  if ([string]::IsNullOrWhiteSpace($Raw)) { return "" }
 
-    $headerWritten = [ref]$false
-    if ($Append) { $headerWritten = [ref]$true }
+  $val = $Raw.Trim()
 
-    $current = [ordered]@{}
-    $chunk = New-Object System.Collections.Generic.List[object]
-    $rows = 0
+  # Cases seen:
+  # 1) 1.3.6.1.4.1.311.... WebServer1W
+  # 2) "1.3.6.1.4.1.311...." WebServer1W
+  # 3) 1.3.6.1.4.1.311.... (WebServer1W)
+  # 4) WebServer1W
+  # 5) pKIExtendedKeyUsage / weird spacing or extra quotes
 
-    $fs = [System.IO.File]::Open($StdoutPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-    try {
-        $sr = New-Object System.IO.StreamReader($fs, [Text.Encoding]::Default)
-        try {
-            while (-not $sr.EndOfStream) {
-                $line = $sr.ReadLine()
-                if ($null -eq $line) { continue }
+  # If parentheses exist, prefer what's inside the last pair.
+  $parenMatch = [regex]::Match($val, '\(([^)]*)\)\s*$')
+  if ($parenMatch.Success -and $parenMatch.Groups[1].Value.Trim()) {
+    return $parenMatch.Groups[1].Value.Trim()
+  }
 
-                if ($line -match '^certutil:' -or $line -match '^-{5,}$' -or $line -match '^\s*$') {
-                    if ($current.Count) {
-                        $o = [ordered]@{}
-                        foreach ($p in $Properties) {
-                            $name = $FieldMap[$p]
-                            $val  = $current[$name]
-                            if ($p -eq 'CertificateTemplate' -and $val) {
-                                if ($val -match '^(?<name>[^\(]+)\s*\(') { $val = $Matches.name.Trim() }
-                            }
-                            if ($p -eq 'Thumbprint' -and $val) { $val = ($val -replace '\s','').ToUpper() }
-                            $o[$p] = $val
-                        }
-                        $chunk.Add([pscustomobject]$o)
-                        $rows++
-                        $current = [ordered]@{}
+  # If there's an OID followed by a name, capture the trailing name.
+  $m = [regex]::Match($val, '^\s*"?\d+(?:\.\d+)+"?\s+(?<name>.+?)\s*$')
+  if ($m.Success) {
+    return $m.Groups['name'].Value.Trim()
+  }
 
-                        if ($chunk.Count -ge $FlushEvery) {
-                            if (-not $headerWritten.Value) {
-                                $chunk | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
-                                $headerWritten.Value = $true
-                            } else {
-                                $chunk | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8 -Append
-                            }
-                            $chunk.Clear()
-                        }
-                    }
-                    continue
-                }
+  # If it looks like only an OID (no name), return empty string
+  if ($val -match '^\s*"?\d+(?:\.\d+)+"?\s*$') { return "" }
 
-                $i = $line.IndexOf(':')
-                if ($i -gt 0) {
-                    $k = ($line.Substring(0,$i)).Trim()
-                    $v = ($line.Substring($i+1)).Trim()
-                    if ($inverse.ContainsKey($k)) {
-                        if ($current.Contains($k)) {
-                            $current[$k] = ($current[$k] + " " + $v).Trim()
-                        } else {
-                            $current[$k] = $v
-                        }
-                    }
-                } else {
-                    if ($current.Count) {
-                        $lastKey = ($current.Keys | Select-Object -Last 1)
-                        if ($lastKey) { $current[$lastKey] = ($current[$lastKey] + " " + $line.Trim()).Trim() }
-                    }
-                }
-            }
-        } finally {
-            $sr.Close()
-        }
-    } finally {
-        $fs.Close()
-    }
-
-    if ($current.Count) {
-        $o = [ordered]@{}
-        foreach ($p in $Properties) {
-            $name = $FieldMap[$p]
-            $val  = $current[$name]
-            if ($p -eq 'CertificateTemplate' -and $val) {
-                if ($val -match '^(?<name>[^\(]+)\s*\(') { $val = $Matches.name.Trim() }
-            }
-            if ($p -eq 'Thumbprint' -and $val) { $val = ($val -replace '\s','').ToUpper() }
-            $o[$p] = $val
-        }
-        $chunk.Add([pscustomobject]$o)
-        $rows++
-    }
-
-    if ($chunk.Count -gt 0) {
-        if (-not $headerWritten.Value) {
-            $chunk | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
-            $headerWritten.Value = $true
-        } else {
-            $chunk | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8 -Append
-        }
-        $chunk.Clear()
-    }
-
-    return $rows
+  # Otherwise, assume it's already a name.
+  return $val.Trim('"')
 }
 
-try {
-    Test-CertutilPresent
-    $cfg = Resolve-CAConfig -Explicit $CAConfig
-
-    # Validate properties (membership test safe for OrderedDictionary)
-    $unknown = $Properties | Where-Object { -not $FieldMap.Contains($_) }
-    if ($unknown) {
-        $valid = ($FieldMap.Keys -join ', ')
-        throw "Unknown property(ies): $($unknown -join ', '). Valid: $valid"
-    }
-    $outFields = $Properties | ForEach-Object { $FieldMap[$_] } | Select-Object -Unique
-
-    Ensure-Dir $OutCsv
-
-    $total = 0
-    $headerExists = Test-Path $OutCsv
-
-    if ($PSBoundParameters.ContainsKey('RequestIDStart') -and $PSBoundParameters.ContainsKey('RequestIDEnd')) {
-        $batchId = 0
-        for ($s = $RequestIDStart; $s -le $RequestIDEnd; $s += $RequestIDBatchSize) {
-            $e = [Math]::Min($s + $RequestIDBatchSize - 1, $RequestIDEnd)
-            $batchId++
-            $restrict = New-Restrict -Disposition $Disposition -ReqStart $s -ReqEnd $e
-            $args = Build-CertutilArgs -CAConfig $cfg -Restrict $restrict -OutFields $outFields
-            $exit,$stdout,$stderr = Start-CertutilToFiles -Args $args -ScratchDir $ScratchDir -TimeoutSec $TimeoutSec -Preview:$Preview
-            if ($Preview) { continue }
-
-            if ($exit -ne 0) {
-                $errText = ''
-                if (Test-Path $stderr) { $errText = (Get-Content -Path $stderr -ErrorAction SilentlyContinue | Out-String).Trim() }
-                throw "Batch $batchId ($s..$e) failed with exit $exit. $errText"
-            }
-
-            $rows = Parse-StdoutFile -StdoutPath $stdout -Properties $Properties -FieldMap $FieldMap -FlushEvery $FlushEvery -OutCsv $OutCsv -Append:$headerExists
-            $total += $rows
-            $headerExists = $true
-
-            # Cleanup temp files
-            Remove-Item -Path $stdout,$stderr -ErrorAction SilentlyContinue
-            Write-Verbose ("Batch {0} [{1}..{2}]: {3} rows (total {4})" -f $batchId,$s,$e,$rows,$total)
-        }
-    } else {
-        $restrict = New-Restrict -Disposition $Disposition -ReqStart $null -ReqEnd $null
-        $args = Build-CertutilArgs -CAConfig $cfg -Restrict $restrict -OutFields $outFields
-        $exit,$stdout,$stderr = Start-CertutilToFiles -Args $args -ScratchDir $ScratchDir -TimeoutSec $TimeoutSec -Preview:$Preview
-        if ($Preview) { return }
-
-        if ($exit -ne 0) {
-            $errText = ''
-            if (Test-Path $stderr) { $errText = (Get-Content -Path $stderr -ErrorAction SilentlyContinue | Out-String).Trim() }
-            throw "certutil failed with exit $exit. $errText"
-        }
-
-        $rows = Parse-StdoutFile -StdoutPath $stdout -Properties $Properties -FieldMap $FieldMap -FlushEvery $FlushEvery -OutCsv $OutCsv -Append:$headerExists
-        $total = $rows
-
-        Remove-Item -Path $stdout,$stderr -ErrorAction SilentlyContinue
-        Write-Verbose ("Streamed export (single pass): {0} rows" -f $rows)
-    }
-
-    Write-Host "Export complete. Total rows: $total -> $OutCsv"
+# Discover the header (first non-empty line)
+[string]$headerLine = $null
+while (-not $stdOut.EndOfStream) {
+  $headerLine = $stdOut.ReadLine()
+  if (-not [string]::IsNullOrWhiteSpace($headerLine)) { break }
 }
-catch {
-    Write-Error $_.Exception.Message
-    try {
-        Ensure-Dir $OutCsv
-        [pscustomobject]@{ Timestamp=(Get-Date).ToString('s'); Error=$_.Exception.Message } |
-            Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
-    } catch {}
-    exit 1
+if ([string]::IsNullOrWhiteSpace($headerLine)) {
+  throw "certutil produced no output."
+}
+
+# Parse header into an array of column names
+$headerCols = Split-CsvLine -Line $headerLine | ForEach-Object { $_.Trim() }
+
+# If user didn’t specify TemplateField, try to locate it.
+if ([string]::IsNullOrWhiteSpace($TemplateField)) {
+  $TemplateField = ($headerCols | Where-Object {
+    $_ -match 'CertificateTemplate' -or $_ -match 'Certificate Template'
+  } | Select-Object -First 1)
+  if (-not $TemplateField) {
+    # Fall back to a common field name, but don’t fail hard
+    $TemplateField = "CertificateTemplate"
+  }
+}
+
+# Prepare writer for the first chunk
+function New-ChunkWriter {
+  param([int]$Index)
+
+  $file = Join-Path $OutputDirectory ("{0}_chunk{1:000000}.csv" -f $BaseFileName, $Index)
+  $sw = New-Object System.IO.StreamWriter($file, $false, [System.Text.Encoding]::UTF8)
+
+  # We will write the *same* headers that we read, but we’ll normalize the template field
+  # to contain only the template display name.
+  $sw.WriteLine(($headerCols -join ','))
+  return @{ Writer = $sw; Path = $file }
+}
+$script:chunk = New-ChunkWriter -Index $script:chunkIndex
+
+function Escape-CsvField {
+  param([string]$s)
+  if ($null -eq $s) { return "" }
+  '"' + ($s -replace '"','""') + '"'
+}
+
+function Print-Status {
+  $now = Get-Date
+  $elapsed = $now - $script:startTime
+  $deltaT = $now - $script:lastTickTime
+  $deltaRows = $script:totalRows - $script:lastTickRows
+  $rps = if ($deltaT.TotalSeconds -gt 0) { [math]::Round($deltaRows / $deltaT.TotalSeconds, 2) } else { 0 }
+  Write-Host ("[{0}] Rows: {1:n0} | Chunk: {2} ({3:n0}/{4:n0}) | Rate: {5} rows/s | Elapsed: {6:hh\:mm\:ss}" -f (Get-Date), $script:totalRows, $script:chunkIndex, $script:rowsInChunk, $BatchSize, $rps, $elapsed)
+  $script:lastTickTime = $now
+  $script:lastTickRows = $script:totalRows
+}
+
+# ---- Stream data lines ----
+while (-not $stdOut.EndOfStream) {
+  $line = $stdOut.ReadLine()
+  if ([string]::IsNullOrWhiteSpace($line)) { continue }
+
+  # Convert one row line into an object using our known header
+  $obj = ConvertFrom-Csv -InputObject $line -Header $headerCols
+
+  # Normalize the template field (if present)
+  if ($obj.PSObject.Properties.Name -contains $TemplateField) {
+    $obj.$TemplateField = Get-TemplateNameOnly -Raw ([string]$obj.$TemplateField)
+  }
+
+  # Write out in the original header order
+  $values = foreach ($h in $headerCols) {
+    Escape-CsvField ([string]$obj.$h)
+  }
+  $script:chunk.Writer.WriteLine(($values -join ','))
+
+  # Counters and rollover
+  $script:rowsInChunk++; $script:totalRows++
+  if ($script:rowsInChunk -ge $BatchSize) {
+    $script:chunk.Writer.Flush(); $script:chunk.Writer.Close()
+    Write-Host ("Chunk complete: {0} rows -> {1}" -f $script:rowsInChunk, $script:chunk.Path) -ForegroundColor Green
+    $script:rowsInChunk = 0
+    $script:chunkIndex++
+    $script:chunk = New-ChunkWriter -Index $script:chunkIndex
+  }
+
+  if (($script:totalRows -gt 0) -and (($script:totalRows % $statusEvery) -eq 0)) {
+    Print-Status
+  }
+}
+
+# Finalize
+if ($script:chunk.Writer) { $script:chunk.Writer.Flush(); $script:chunk.Writer.Close() }
+
+$errText = $stdErr.ReadToEnd()
+$proc.WaitForExit()
+
+Write-Host ""
+Write-Host ("Done. Total rows: {0:n0}, Chunks: {1}, Duration: {2:hh\:mm\:ss}" -f $script:totalRows, $script:chunkIndex, ((Get-Date) - $script:startTime)) -ForegroundColor Cyan
+if ($errText) {
+  Write-Warning "certutil reported messages on stderr:"
+  Write-Host $errText
 }
